@@ -2308,12 +2308,7 @@ static void filemap_get_read_batch(struct address_space *mapping,
 {
 	XA_STATE(xas, &mapping->i_pages, index);
 	struct folio *folio;
-	if (mapping_use_distributed_support(mapping)) {
-		// int ret = perform_udp_request();
-        // if (ret < 0) {
-        //     printk(KERN_ERR "Remote: UDP request failed with error %d\n", ret);
-        // }
-	}
+
 	rcu_read_lock();
 	for (folio = xas_load(&xas); folio; folio = xas_next(&xas)) {
 		if (xas_retry(&xas, folio))
@@ -2514,6 +2509,42 @@ static int filemap_readahead(struct kiocb *iocb, struct file *file,
 	return 0;
 }
 
+static int write_remote_to_pagecache(struct inode *inode, loff_t pos, size_t count, char* buf) 
+{
+	struct address_space *mapping = inode->i_mapping;
+	const struct address_space_operations *aops = mapping->a_ops;
+
+	if (pos + count > inode->i_sb->s_maxbytes)
+		return -EFBIG;
+
+	while (count) {
+		size_t n = min_t(size_t, count,
+				 PAGE_SIZE - offset_in_page(pos));
+		struct page *page;
+		void *fsdata = NULL;
+		int res;
+		pr_info("Before write begin\n");
+		res = aops->write_begin(NULL, mapping, pos, n, &page, &fsdata);
+		if (res)
+			return res;
+
+		memcpy_to_page(page, offset_in_page(pos), buf, n);
+
+		res = aops->write_end(NULL, mapping, pos, n, n, page, fsdata);
+		pr_info("After write begin\n");
+		if (res < 0)
+			return res;
+		if (res != n)
+			return -EIO;
+
+		buf += n;
+		pos += n;
+		count -= n;
+	}
+	return 0;
+}
+
+
 static int filemap_get_pages(struct kiocb *iocb, size_t count,
 		struct folio_batch *fbatch, bool need_uptodate)
 {
@@ -2525,21 +2556,57 @@ static int filemap_get_pages(struct kiocb *iocb, size_t count,
 	struct folio *folio;
 	int err = 0;
 
+	char *tmp_path;
+    char path_buf[256]; 
+	int printedd = 0;
+	tmp_path = d_path(&filp->f_path, path_buf, sizeof(path_buf));
+
+	if (!IS_ERR(tmp_path) && strstr(tmp_path, "mamad.sh") != NULL) {
+		printk(KERN_INFO "Remote: temp found");
+		printedd = 1;
+	}
+
 	/* "last_index" is the index of the page beyond the end of the read */
 	last_index = DIV_ROUND_UP(iocb->ki_pos + count, PAGE_SIZE);
 retry:
 	if (fatal_signal_pending(current))
 		return -EINTR;
 
+	if (printedd) printk(KERN_INFO "Remote: Before page cache1");
 	filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
+	if (printedd) printk(KERN_INFO "Remote: Affteerrr page cache1");
 	if (!folio_batch_count(fbatch)) {
+		if (printedd) printk(KERN_INFO "Remote: READAHEAD");
+		/*If not in page cache and remote, send request*/
+		if (filp->f_flags & O_REMOTE) {
+			char* buffer;
+			// char* buffer;
+			buffer = kmalloc(1024, GFP_KERNEL);
+			if (!buffer) {
+				printk(KERN_ERR "Remote: Failed to allocate memory for buffer\n");
+				return -ENOMEM;
+			}
+			memset(buffer, 0, 1024);
+
+			int ret = 0;
+			ret = call_remote_storage("load.sh", count, index, buffer);
+			if (ret >= 0) {
+				struct inode *inode = filp->f_inode;
+				//if no error, write to page cache
+				write_remote_to_pagecache(inode, index, count, buffer);
+			}
+		}
+		
 		if (iocb->ki_flags & IOCB_NOIO)
 			return -EAGAIN;
 		page_cache_sync_readahead(mapping, ra, filp, index,
 				last_index - index);
+		if (printedd) printk(KERN_INFO "Remote: Affteerrr readahead");
 		filemap_get_read_batch(mapping, index, last_index - 1, fbatch);
+		if (printedd) printk(KERN_INFO "Remote: Affteerrr page cache222");
 	}
 	if (!folio_batch_count(fbatch)) {
+		if (printedd) printk(KERN_INFO "Remote: Inside reaad disk");
 		if (iocb->ki_flags & (IOCB_NOWAIT | IOCB_WAITQ))
 			return -EAGAIN;
 		err = filemap_create_folio(filp, mapping,
@@ -2621,7 +2688,7 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
     char path_buf[256]; 
 	tmp_path = d_path(&filp->f_path, path_buf, sizeof(path_buf));
 
-	if (!IS_ERR(tmp_path) && strstr(tmp_path, "load.sh") != NULL) {
+	if (!IS_ERR(tmp_path) && strstr(tmp_path, "mamad.sh") != NULL) {
 		if (filp->f_flags & O_REMOTE) {
 			printk(KERN_INFO "Remote: mapping changed to remote");
 			mapping_set_distributed_support(mapping);
